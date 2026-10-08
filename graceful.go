@@ -271,16 +271,28 @@ func (srv *Server) Serve(listener net.Listener) error {
 	active := make(chan net.Conn)
 	remove := make(chan net.Conn)
 
+	// kill is closed when the shutdown timeout expires and manageConnections
+	// stops receiving, so the hook below must not block on its sends after
+	// that. (net/http reads Server.ConnState concurrently, so it must not be
+	// changed once serving starts.)
+	kill := make(chan struct{})
+	notify := func(ch chan net.Conn, conn net.Conn) {
+		select {
+		case ch <- conn:
+		case <-kill:
+		}
+	}
+
 	srv.Server.ConnState = func(conn net.Conn, state http.ConnState) {
 		switch state {
 		case http.StateNew:
-			add <- conn
+			notify(add, conn)
 		case http.StateActive:
-			active <- conn
+			notify(active, conn)
 		case http.StateIdle:
-			idle <- conn
+			notify(idle, conn)
 		case http.StateClosed, http.StateHijacked:
-			remove <- conn
+			notify(remove, conn)
 		}
 
 		srv.stopLock.Lock()
@@ -293,7 +305,6 @@ func (srv *Server) Serve(listener net.Listener) error {
 
 	// Manage open connections
 	shutdown := make(chan chan struct{})
-	kill := make(chan struct{})
 	go srv.manageConnections(add, idle, active, remove, shutdown, kill)
 
 	interrupt := srv.interruptChan()
@@ -396,7 +407,6 @@ func (srv *Server) manageConnections(add, idle, active, remove chan net.Conn, sh
 			srv.stopLock.Lock()
 			defer srv.stopLock.Unlock()
 
-			srv.Server.ConnState = nil
 			for k := range srv.connections {
 				if err := k.Close(); err != nil {
 					srv.logf("[ERROR] %s", err)
