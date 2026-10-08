@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -323,11 +324,27 @@ func TestGracefulForwardsConnState(t *testing.T) {
 	go launchTestQueries(t, &wg, c)
 	wg.Wait()
 
-	stateLock.Lock()
-	if !reflect.DeepEqual(states, expected) {
-		t.Errorf("Incorrect connection state tracking.\n  actual: %v\nexpected: %v\n", states, expected)
+	// The forwarded callback for the final state of a connection can still be
+	// running after Serve returns, so allow it a little time to arrive.
+	var actual map[http.ConnState]int
+
+	deadline := time.Now().Add(timeoutTime)
+
+	for {
+		stateLock.Lock()
+		actual = maps.Clone(states)
+		stateLock.Unlock()
+
+		if reflect.DeepEqual(actual, expected) || time.Now().After(deadline) {
+			break
+		}
+
+		time.Sleep(10 * time.Millisecond)
 	}
-	stateLock.Unlock()
+
+	if !reflect.DeepEqual(actual, expected) {
+		t.Errorf("Incorrect connection state tracking.\n  actual: %v\nexpected: %v\n", actual, expected)
+	}
 }
 
 func TestGracefulExplicitStop(t *testing.T) {
@@ -689,4 +706,194 @@ type SyncBuffer struct {
 func (buf *SyncBuffer) Write(b []byte) (int, error) {
 	defer buf.Done()
 	return buf.Buffer.Write(b)
+}
+
+// TestStopTimeoutWithActiveConnectionHasNoRace checks that a Stop whose
+// timeout expires while a request is still in flight, and while idle
+// connections are being closed, does not race with net/http's own connection
+// state handling. Run with -race.
+func TestStopTimeoutWithActiveConnectionHasNoRace(t *testing.T) {
+	for range 10 {
+		stopWithTimeoutDuringActiveRequest(t, 16)
+	}
+}
+
+func stopWithTimeoutDuringActiveRequest(t *testing.T, idleConns int) {
+	t.Helper()
+
+	states := newConnStates()
+	inHandler := make(chan struct{})
+	release := make(chan struct{})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(rw http.ResponseWriter, _ *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/block", func(rw http.ResponseWriter, _ *http.Request) {
+		close(inHandler)
+		<-release
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	l, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := &Server{
+		Server:           &http.Server{Handler: mux, ReadHeaderTimeout: timeoutTime},
+		NoSignalHandling: true,
+		ConnState:        states.record,
+	}
+
+	served := make(chan error, 1)
+
+	go func() { served <- srv.Serve(l) }()
+
+	url := "http://" + l.Addr().String()
+	client := &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: idleConns}}
+
+	defer client.CloseIdleConnections()
+
+	openIdleConnections(t, client, url, idleConns)
+
+	clientErr := make(chan error, 1)
+
+	go func() {
+		clientErr <- get(t, http.DefaultClient, url+"/block")
+	}()
+
+	select {
+	case <-inHandler:
+	case <-time.After(timeoutTime):
+		t.Fatal("request never reached the handler")
+	}
+
+	// A tiny timeout means the kill path runs while net/http is still
+	// updating the state of the idle connections that shutdown closes.
+	srv.Stop(time.Nanosecond)
+
+	select {
+	case <-srv.StopChan():
+	case <-time.After(timeoutTime):
+		t.Fatal("timed out waiting for the server to stop")
+	}
+
+	select {
+	case err = <-clientErr:
+		if err == nil {
+			t.Error("expected the in-flight request to be killed")
+		}
+	case <-time.After(timeoutTime):
+		t.Fatal("in-flight connection was not closed when the timeout expired")
+	}
+
+	close(release)
+
+	select {
+	case <-served:
+	case <-time.After(timeoutTime):
+		t.Fatal("Serve did not return")
+	}
+
+	// Every connection was opened before Stop, so all must be reported closed,
+	// including those closed by the kill path. (The client may reuse
+	// connections, so there can be fewer than idleConns+1 of them.)
+	opened, closed := states.waitAllClosed(timeoutTime)
+	if opened < 2 || closed != opened {
+		t.Fatalf("expected StateClosed forwarded for every connection; opened %d, closed %d", opened, closed)
+	}
+}
+
+// connStates records which connections a user ConnState callback has seen
+// opened and closed.
+type connStates struct {
+	mu     sync.Mutex
+	opened map[net.Conn]bool
+	closed map[net.Conn]bool
+}
+
+func newConnStates() *connStates {
+	return &connStates{opened: make(map[net.Conn]bool), closed: make(map[net.Conn]bool)}
+}
+
+func (c *connStates) record(conn net.Conn, state http.ConnState) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	switch state {
+	case http.StateNew:
+		c.opened[conn] = true
+	case http.StateClosed:
+		c.closed[conn] = true
+	default:
+	}
+}
+
+// waitAllClosed waits up to timeout for every opened connection to have been
+// reported closed, returning the opened and closed counts.
+func (c *connStates) waitAllClosed(timeout time.Duration) (int, int) {
+	deadline := time.Now().Add(timeout)
+
+	for {
+		c.mu.Lock()
+		opened, closed := len(c.opened), len(c.closed)
+		c.mu.Unlock()
+
+		if (opened > 0 && opened == closed) || time.Now().After(deadline) {
+			return opened, closed
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// openIdleConnections makes n concurrent requests with client so that n
+// keep-alive connections are left idle on the server.
+func openIdleConnections(t *testing.T, client *http.Client, url string, n int) {
+	t.Helper()
+
+	var wg sync.WaitGroup
+
+	errs := make(chan error, n)
+
+	for range n {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			errs <- get(t, client, url)
+		}()
+	}
+
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// get makes a GET request to url with client and reads the whole response.
+func get(t *testing.T, client *http.Client, url string) error {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+
+	defer resp.Body.Close()
+
+	_, err = io.Copy(io.Discard, resp.Body)
+
+	return err
 }

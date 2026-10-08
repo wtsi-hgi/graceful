@@ -1,7 +1,17 @@
-graceful [![GoDoc](https://godoc.org/github.com/tylerb/graceful?status.png)](http://godoc.org/github.com/tylerb/graceful) [![Build Status](https://travis-ci.org/tylerb/graceful.svg?branch=master)](https://travis-ci.org/tylerb/graceful) [![Coverage Status](https://coveralls.io/repos/tylerb/graceful/badge.svg)](https://coveralls.io/r/tylerb/graceful) [![Gitter](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/tylerb/graceful?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge)
+graceful [![Go Reference](https://pkg.go.dev/badge/github.com/wtsi-hgi/graceful.svg)](https://pkg.go.dev/github.com/wtsi-hgi/graceful) [![tests](https://github.com/wtsi-hgi/graceful/actions/workflows/tests.yml/badge.svg)](https://github.com/wtsi-hgi/graceful/actions/workflows/tests.yml) [![golangci-lint](https://github.com/wtsi-hgi/graceful/actions/workflows/golangci-lint.yml/badge.svg)](https://github.com/wtsi-hgi/graceful/actions/workflows/golangci-lint.yml)
 ========
 
-Graceful is a Go 1.3+ package enabling graceful shutdown of http.Handler servers.
+Graceful is a Go package enabling graceful shutdown of http.Handler servers.
+
+This is a maintained fork of the archived
+[tylerb/graceful](https://github.com/tylerb/graceful), published as the Go
+module `github.com/wtsi-hgi/graceful`. It fixes a data race in which a `Stop`
+timeout expiring with active connections wrote `http.Server.ConnState` while
+`net/http` was reading it.
+
+One behaviour changes as a result: a user `ConnState` callback now receives
+`StateClosed` for connections closed when the `Stop` timeout expires. Before,
+those notifications were dropped racily or their goroutines hung.
 
 ## Using Go 1.8?
 
@@ -13,10 +23,8 @@ method for graceful shutdowns.
 To install, simply execute:
 
 ```
-go get gopkg.in/tylerb/graceful.v1
+go get github.com/wtsi-hgi/graceful
 ```
-
-I am using [gopkg.in](http://labix.org/gopkg.in) to control releases.
 
 ## Usage
 
@@ -26,7 +34,7 @@ Using Graceful is easy. Simply create your http.Handler and pass it to the `Run`
 package main
 
 import (
-  "gopkg.in/tylerb/graceful.v1"
+  "github.com/wtsi-hgi/graceful"
   "net/http"
   "fmt"
   "time"
@@ -49,7 +57,7 @@ package main
 
 import (
   "github.com/codegangsta/negroni"
-  "gopkg.in/tylerb/graceful.v1"
+  "github.com/wtsi-hgi/graceful"
   "net/http"
   "fmt"
   "time"
