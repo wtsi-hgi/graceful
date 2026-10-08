@@ -2,10 +2,10 @@ package main
 
 import (
 	"fmt"
+	"net/http"
 	"sync"
 
-	"github.com/urfave/negroni"
-	"gopkg.in/tylerb/graceful.v1"
+	"github.com/wtsi-hgi/graceful"
 )
 
 func main() {
@@ -14,21 +14,21 @@ func main() {
 
 	wg.Add(3)
 	go func() {
-		n := negroni.New()
+		n := http.NewServeMux()
 		fmt.Println("Launching server on :3000")
 		graceful.Run(":3000", 0, n)
 		fmt.Println("Terminated server on :3000")
 		wg.Done()
 	}()
 	go func() {
-		n := negroni.New()
+		n := http.NewServeMux()
 		fmt.Println("Launching server on :3001")
 		graceful.Run(":3001", 0, n)
 		fmt.Println("Terminated server on :3001")
 		wg.Done()
 	}()
 	go func() {
-		n := negroni.New()
+		n := http.NewServeMux()
 		fmt.Println("Launching server on :3002")
 		graceful.Run(":3002", 0, n)
 		fmt.Println("Terminated server on :3002")
